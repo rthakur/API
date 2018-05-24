@@ -1,0 +1,321 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Auth, Google;
+use App\File;
+use App\User;
+use App\GoogleDrive;
+
+class FileController extends Controller
+{
+  public function index(Request $request , $category)
+  {
+    if(!in_array($category,$this->fileCategories()))
+        return redirect('/');
+
+
+      $data['category'] = $category;
+
+      $files = File::orderBy('id','desc');
+
+      if($request->has('folderId'))
+      {
+        $files = $files->where('google_drive_id',$request->folderId);
+        $data['search'] = $request->s;
+      }
+
+      if($request->has('s'))
+      {
+        $files = $files->where('name','like','%'.$request->s.'%');
+        $data['search'] = $request->s;
+      }
+
+     if(Auth::user()->role_id != '1')
+         $files->whereIn('user_id',Auth::user()->getUsers());
+
+
+      if($category == 'google-drive-files')
+      {
+        $files = $files->where('category', 'google-drive-files');
+
+      }else{
+
+        if($category == 'documents')
+         $files = $files->where('type', 'NOT LIKE', '%image/%');
+
+        elseif($category == 'images')
+          $files = $files->where('type', 'LIKE', '%image/%');
+
+        else
+          $files->where('type', 'NOT LIKE', '%image/%')->where('category','other');
+
+      }
+
+
+    $data['files'] = $files->whereIn('user_id',Auth::user()->getUsers())->paginate(100);
+
+    return view('files.index',$data);
+  }
+
+  public function store(Request $request)
+   {
+      $lastAddmimeType = '';
+
+      $files = $request->file('file');
+      foreach($files as $file)
+       {
+         if($file->isValid())
+         {
+         $path = 'upload/files/'.Auth::id();
+
+         if (!is_dir($path))
+            mkdir($path, 0777, true);
+
+          $size =  $file->getsize();
+          $type =  $file->getmimeType();
+          $lastAddmimeType = $type;
+
+          $fileName =  uniqid().'.'. $file->getClientOriginalExtension();
+
+          $FileStore = new File;
+
+          //upload to s3
+          if(env('AWS_KEY'))
+          {
+            \Storage::disk('s3')->put($path.'/'.$fileName, fopen($file, 'r+'));
+            $FileStore->s3_upload = 1;
+          }else{
+          $file->move( $path, $fileName);
+          }
+
+          $FileStore->type = $type;
+          $FileStore->size = $size;
+          $FileStore->name = $fileName;
+          $FileStore->path = $path.'/'.$fileName;
+          $FileStore->user_id = Auth::id();
+          $FileStore->category = $request->category;
+          $FileStore->save();
+
+        }
+
+       }
+
+
+
+       $lastAddmimeType = explode('/', $lastAddmimeType);
+
+
+
+       if(isset($lastAddmimeType[0]) && $lastAddmimeType[0] == 'image')
+        return redirect('file/images');
+
+       if(isset($lastAddmimeType[0]) && $lastAddmimeType[0] == 'application')
+        return redirect('file/documents');
+
+        return back();
+
+   }
+
+   public function destroy($id)
+       {
+          File::where('id',$id)->where('user_id', Auth::id())->delete();
+          return back();
+       }
+
+    public function edit(Request $request)
+    {
+         File::where('id',$request->id)->update(['name'=>$request->name]);
+    }
+
+    public function download($fileId)
+    {
+        $fileId = base64_decode($fileId);
+        $file = File::where('id','=', $fileId)->firstOrFail();
+
+       if(!$file) return redirect('/');
+
+      $ext = pathinfo($file->path, PATHINFO_EXTENSION);
+
+      return response()->download(public_path($file->path), $file->name.'.'.$ext);
+    }
+
+    private function fileCategories()
+    {
+      return ['documents','other','images','google-drive-files'];
+    }
+
+    public function getGoogleDriveFiles(Request $request)
+    {
+      if(Auth::user()->role_id != '1')
+        return  redirect('/');
+
+      try {
+
+        $googleDriveFolderId = '';
+
+
+        $googleClient = Google::getClient();
+        $googleClient->setRedirectUri(env('GOOGLE_DRIVE_REDIRECT_URL'));
+
+        if (Auth::user()->google_drive_access_token)
+        {
+          $token = json_decode(Auth::user()->google_drive_access_token, true);
+        } else if (!empty($request->code)) {
+
+          $code = $request->code;
+          $token = $googleClient->fetchAccessTokenWithAuthCode($code);
+
+          $user = Auth::user();
+          $user->google_drive_access_token = json_encode($token);
+          $user->save();
+
+          $this->createNotification('Successfully Synchronized');
+
+          return redirect('/file/google-drive-files');
+
+        } else {
+          $googleClient->setRedirectUri(env('GOOGLE_DRIVE_REDIRECT_URL'));
+          $url = $googleClient->createAuthUrl();
+          $url  = str_replace('&state','&state='.Auth::id(), $url);
+          return redirect((string) $url);
+        }
+
+        $googleClient->setAccessToken($token);
+
+        if ($googleClient->isAccessTokenExpired())
+        {
+          $token = $googleClient->fetchAccessTokenWithRefreshToken(isset($token['refresh_token']) ? $token['refresh_token'] : $token);
+          $user = Auth::user();
+          $user->google_drive_access_token = json_encode($token);
+          $user->save();
+        }
+
+
+         $parameters['q'] = "mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false";
+         $service = Google::make('drive');
+
+        $drives = $service->files->listFiles($parameters);
+
+        foreach ($drives as $drive)
+          {
+            $addDrive = GoogleDrive::updateOrCreate(['drive_id' => $drive->id,'user_id' => Auth::id()]);
+            $addDrive->name = $drive->name;
+            $addDrive->user_id = Auth::id();
+            $addDrive->drive_id = $drive->id;
+            $addDrive->drive_type = $drive->mimeType;
+            $addDrive->save();
+          }
+
+        return view('files.google.google_drive');
+      } catch (\Exception $e) {
+
+        $user = Auth::user();
+        $user->google_drive_access_token = '';
+        $user->save();
+        \Log::info($e->getMessage().$user);
+        echo $e->getMessage();
+      //  return redirect('file/google/drivesync');
+      }
+
+   }
+
+   public function multipleDelete(Request $request)
+   {
+         foreach ($request->id as $id)
+            {
+              $ids = File::find($id);
+              if($ids)
+              $ids->delete();
+            }
+        return back();
+   }
+
+
+   public function saveFolderfiles($folderId)
+   {
+     $id = base64_decode($folderId);
+     $googleDrive  = GoogleDrive::where('id',$id)->where('user_id',Auth::id())->first();
+     if(!$googleDrive)
+     {
+       $this->createNotification('Something went wrong','error');
+       return redirect('/file/google-drive-files');
+     }
+
+     $googleDriveFolderId = $googleDrive->drive_id;
+     try {
+       $googleClient = Google::getClient();
+       $googleClient->setRedirectUri(env('GOOGLE_DRIVE_REDIRECT_URL'));
+       if (Auth::user()->google_drive_access_token)
+       {
+         $token = json_decode(Auth::user()->google_drive_access_token, true);
+       } else if (!empty($request->code)) {
+
+         $code = $request->code;
+         $token = $googleClient->fetchAccessTokenWithAuthCode($code);
+
+         $user = Auth::user();
+         $user->google_drive_access_token = json_encode($token);
+         $user->save();
+
+         $this->createNotification('Successfully Synchronized');
+
+         return redirect('/file/google-drive-files');
+
+       } else {
+         $googleClient->setRedirectUri(env('GOOGLE_DRIVE_REDIRECT_URL'));
+         $url = $googleClient->createAuthUrl();
+         $url  = str_replace('&state','&state='.Auth::id(), $url);
+         return redirect((string) $url);
+       }
+
+       $googleClient->setAccessToken($token);
+
+       if ($googleClient->isAccessTokenExpired())
+       {
+         $token = $googleClient->fetchAccessTokenWithRefreshToken(isset($token['refresh_token']) ? $token['refresh_token'] : $token);
+         $user = Auth::user();
+         $user->google_drive_access_token = json_encode($token);
+         $user->save();
+       }
+
+       $parameters['q'] = "'$googleDriveFolderId' in parents and trashed=false";
+
+       $service = Google::make('drive');
+
+       $drives = $service->files->listFiles($parameters);
+
+       foreach ($drives as $file)
+       {
+         $googleFileName  = $file['name'].$file['fileExtension'];
+         $googleFileStore = File::firstorNew(['user_id' => Auth::id(), 'google_file_id' => $file['id']]);
+         $googleFileStore->type = $file['mimeType'];
+         $googleFileStore->size = 0000;
+         $googleFileStore->name = $googleFileName;
+        // $googleFileStore->path = '';
+         $googleFileStore->user_id = Auth::id();
+         $googleFileStore->category = 'google-drive-files';
+         $googleFileStore->google_file_id = $file['id'];
+         $googleFileStore->google_drive_id = $googleDrive->id;
+         $googleFileStore->save();
+       }
+       $this->createNotification('Successfully Synchronized');
+       return redirect('/file/google-drive-files');
+
+     } catch (\Exception $e) {
+
+       $user = Auth::user();
+       $user->google_drive_access_token = '';
+       $user->save();
+       \Log::info($e->getMessage().$user);
+       echo $e->getMessage();
+     //  return redirect('file/google/drivesync');
+     }
+
+   }
+
+
+
+}
+
